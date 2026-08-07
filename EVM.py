@@ -1,34 +1,29 @@
-"""Converted from color_mag.ipynb - Optimized for Codespace"""
+"""Live Color Magnification - Headless Mode for Codespace"""
 
 # ===== Imports =====
-import os
 import numpy as np 
 import cv2
-import matplotlib
-matplotlib.use('Agg')  # Headless backend for Codespace
-import matplotlib.pyplot as plt
 import scipy.signal as signal
-from PIL import Image
+from collections import deque
+import time
+import os
 import warnings
 warnings.filterwarnings('ignore')
 
-# ===== Configuration - REDUCED FOR CODESPACE =====
-DATA_PATH = "videos"
-VIDEO_NAME = "face.mp4"
-VIDEO_PATH = os.path.join(DATA_PATH, VIDEO_NAME)
+# ===== Configuration =====
+# Video file settings
+VIDEO_PATH = "videos/face.mp4"  # Change to your video path
+OUTPUT_VIDEO_PATH = "evm_output.mp4"  # Output video path
 
-# Memory-saving settings
-SCALE_FACTOR = 0.3  # Process at 30% resolution
-LEVEL = 3  # Reduced pyramid level (was 4)
-MAX_FRAMES = 150  # Process fewer frames
-ALPHA = 50.0  # Magnification factor
+# Processing settings
+RESIZE_FACTOR = 0.5  # Reduce resolution for faster processing
+FRAME_BUFFER_SIZE = 150  # Number of frames to keep for filtering
 
-# Temporal filter parameters (for heart rate ~60-100 BPM)
-f_lo = 50/60  # 0.833 Hz
-f_hi = 60/60  # 1.0 Hz
-
-print(f"VIDEO_PATH: {VIDEO_PATH}")
-print(f"Exists: {os.path.exists(VIDEO_PATH)}")
+# EVM Parameters
+ALPHA = 30.0  # Magnification factor
+LEVEL = 3  # Gaussian pyramid level
+f_lo = 50/60  # 0.833 Hz (lower bound)
+f_hi = 60/60  # 1.0 Hz (upper bound)
 
 # ===== Color Space Functions =====
 def rgb2yiq(rgb):
@@ -63,7 +58,6 @@ def gaussian_pyramid(image, level):
     scale = 2**level
     pyramid = np.zeros((colors, rows//scale, cols//scale))
     
-    # Make sure we downsample the correct number of times
     img = image.copy()
     for i in range(level):
         img = cv2.pyrDown(img)
@@ -74,304 +68,388 @@ def gaussian_pyramid(image, level):
     
     return pyramid
 
-# ===== Load Video Frames =====
-print("\nLoading video frames...")
-frames = []
-cap = cv2.VideoCapture(VIDEO_PATH)
-fs = cap.get(cv2.CAP_PROP_FPS)
-
-if fs <= 0:
-    fs = 30.0  # Default if detection fails
-
-idx = 0
-
-while(cap.isOpened() and idx < MAX_FRAMES):
-    ret, frame = cap.read()
-    if not ret:
-        break
-    
-    if idx == 0:
-        og_h, og_w, _ = frame.shape
-        w = int(og_w * SCALE_FACTOR)
-        h = int(og_h * SCALE_FACTOR)
-        print(f"Original size: {og_w}x{og_h}, Processing at: {w}x{h}")
-    
-    # Convert to YIQ
-    frame = bgr2yiq(np.float32(frame/255))
-    
-    # Resize
-    if SCALE_FACTOR < 1.0:
-        frame = cv2.resize(frame, (w, h))
-    
-    frames.append(frame)
-    idx += 1
-
-cap.release()
-cv2.destroyAllWindows()
-
-NUM_FRAMES = len(frames)
-print(f"✅ Loaded {NUM_FRAMES} frames at {fs} FPS")
-
-if NUM_FRAMES == 0:
-    print("❌ No frames loaded! Check video path.")
-    exit()
-
-# ===== Create Temporal Filter =====
-print("\nCreating temporal filter...")
-# IMPORTANT: Use NUM_FRAMES for filter taps, not a fixed number
-numtaps = NUM_FRAMES  # Use all frames for better filtering
-
-try:
-    bandpass = signal.firwin(
-        numtaps=numtaps,
-        cutoff=(f_lo, f_hi),
-        fs=fs,
-        pass_zero=False
-    )
-    print(f"✅ Filter created with {numtaps} taps")
-except Exception as e:
-    print(f"⚠️ Filter creation failed: {e}")
-    # Fallback to simpler filter with fewer taps
-    numtaps = min(NUM_FRAMES, 50)
-    bandpass = signal.firwin(
-        numtaps=numtaps,
-        cutoff=(0.8, 1.2),
-        fs=fs,
-        pass_zero=False
-    )
-    print(f"✅ Fallback filter created with {numtaps} taps")
-
-transfer_function = np.fft.fft(np.fft.ifftshift(bandpass))
-
-# ===== Build Gaussian Pyramid =====
-print("\nBuilding Gaussian pyramid...")
-rows, cols, colors = frames[0].shape
-scale = 2**LEVEL
-
-# Ensure dimensions are divisible by scale
-rows_proc = (rows // scale) * scale
-cols_proc = (cols // scale) * scale
-
-pyramid_stack = np.zeros((NUM_FRAMES, colors, rows_proc//scale, cols_proc//scale), dtype=np.float32)
-
-for i, frame in enumerate(frames):
-    # Crop to divisible size if needed
-    if frame.shape[0] != rows_proc or frame.shape[1] != cols_proc:
-        frame = frame[:rows_proc, :cols_proc, :]
-    
-    pyramid = gaussian_pyramid(frame, LEVEL)
-    pyramid_stack[i, :, :, :] = pyramid
-
-print(f"✅ Pyramid built: {pyramid_stack.shape}")
-
-# Free some memory
-del frames
-
-# ===== Apply Temporal Filtering =====
-print("\nApplying temporal filtering...")
-try:
-    # FFT along time axis
-    pyr_stack_fft = np.fft.fft(pyramid_stack, axis=0).astype(np.complex64)
-    
-    # IMPORTANT FIX: Ensure transfer_function matches the number of frames
-    # If transfer_function is shorter, pad it; if longer, truncate
-    if len(transfer_function) < NUM_FRAMES:
-        # Pad with zeros
-        tf_padded = np.zeros(NUM_FRAMES, dtype=transfer_function.dtype)
-        tf_padded[:len(transfer_function)] = transfer_function
-    else:
-        # Truncate to NUM_FRAMES
-        tf_padded = transfer_function[:NUM_FRAMES]
-    
-    # Apply filter with correct broadcasting
-    _filtered_pyramid = pyr_stack_fft * tf_padded[:, None, None, None].astype(np.complex64)
-    
-    # Inverse FFT
-    filtered_pyramid = np.fft.ifft(_filtered_pyramid, axis=0).real
-    
-    # Free memory
-    del pyr_stack_fft, _filtered_pyramid, tf_padded
-    
-    print(f"✅ Filtering complete: {filtered_pyramid.shape}")
-    
-except MemoryError as e:
-    print(f"❌ Memory error during filtering: {e}")
-    print("Try reducing SCALE_FACTOR or MAX_FRAMES further")
-    exit()
-except Exception as e:
-    print(f"❌ Error during filtering: {e}")
-    exit()
-
-# ===== Apply Magnification =====
-print("\nApplying magnification...")
-magnified = []
-magnified_only = []
-
-# Store original pyramid for later use (we already have pyramid_stack)
-original_pyramid = pyramid_stack.copy()
-
-for i in range(NUM_FRAMES):
-    try:
-        # Get original channels from pyramid
-        y_chan = original_pyramid[i, 0, :, :]
-        i_chan = original_pyramid[i, 1, :, :]
-        q_chan = original_pyramid[i, 2, :, :]
+# ===== EVM Processor =====
+class EVMProcessor:
+    def __init__(self, buffer_size=FRAME_BUFFER_SIZE, alpha=ALPHA, level=LEVEL):
+        self.buffer_size = buffer_size
+        self.alpha = alpha
+        self.level = level
+        self.frame_buffer = deque(maxlen=buffer_size)
+        self.yiq_buffer = deque(maxlen=buffer_size)
+        self.pyramid_buffer = deque(maxlen=buffer_size)
+        self.filtered_buffer = deque(maxlen=buffer_size)
+        self.original_frames = deque(maxlen=buffer_size)
         
-        # Get filtered channels
-        fy_chan = filtered_pyramid[i, 0, :, :] * ALPHA
-        fi_chan = filtered_pyramid[i, 1, :, :] * ALPHA
-        fq_chan = filtered_pyramid[i, 2, :, :] * ALPHA
+        self.fs = 30.0
+        self.bandpass = None
+        self.transfer_function = None
         
-        # Upscale filtered channels back to original size
-        fy_chan = cv2.resize(fy_chan, (cols_proc, rows_proc))
-        fi_chan = cv2.resize(fi_chan, (cols_proc, rows_proc))
-        fq_chan = cv2.resize(fq_chan, (cols_proc, rows_proc))
+        self.rows = None
+        self.cols = None
+        self.colors = 3
         
-        # Upscale original pyramid channels too
-        y_chan_up = cv2.resize(y_chan, (cols_proc, rows_proc))
-        i_chan_up = cv2.resize(i_chan, (cols_proc, rows_proc))
-        q_chan_up = cv2.resize(q_chan, (cols_proc, rows_proc))
-        
-        # Create YIQ image
-        yiq_mag = np.zeros((rows_proc, cols_proc, 3), dtype=np.float32)
-        yiq_mag[:, :, 0] = y_chan_up + fy_chan
-        yiq_mag[:, :, 1] = i_chan_up + fi_chan
-        yiq_mag[:, :, 2] = q_chan_up + fq_chan
-        
-        # Convert to RGB
-        mag = inv_colorspace(yiq_mag)
-        magnified.append(mag)
-        
-        # Store magnified only
-        mag_only = np.dstack((fy_chan, fi_chan, fq_chan))
-        magnified_only.append(mag_only)
-        
-    except Exception as e:
-        print(f"⚠️ Error processing frame {i}: {e}")
-        continue
-
-print(f"✅ Magnification complete: {len(magnified)} frames")
-
-if len(magnified) == 0:
-    print("❌ No frames were magnified successfully!")
-    exit()
-
-# ===== Simple Heart Rate Detection =====
-print("\nDetecting heart rate...")
-try:
-    # Use the magnified video to detect heart rate
-    reds = []
-    for i in range(min(NUM_FRAMES, len(magnified))):
-        if i < len(magnified):
-            reds.append(np.mean(magnified[i][:, :, 0]))
-
-    reds = np.array(reds)
-
-    if len(reds) > 1:
-        freqs = np.fft.rfftfreq(len(reds)) * fs
-        rates = np.abs(np.fft.rfft(reds)) / len(reds)
-        
-        # Find peaks
-        from scipy.signal import find_peaks
-        peaks, _ = find_peaks(rates[1:], height=np.max(rates[1:]) * 0.3)
-        
-        if len(peaks) > 0:
-            peak_idx = peaks[0] + 1
-            bpm = freqs[peak_idx] * 60
-            print(f"✅ Estimated heart rate: {bpm:.1f} BPM")
+        self.bpm = 0
+        self.heart_rates = deque(maxlen=10)
+        self.processed_frames = []
+    
+    def create_filter(self, num_taps):
+        """Create bandpass filter"""
+        try:
+            self.bandpass = signal.firwin(
+                numtaps=num_taps,
+                cutoff=(f_lo, f_hi),
+                fs=self.fs,
+                pass_zero=False
+            )
+            self.transfer_function = np.fft.fft(np.fft.ifftshift(self.bandpass))
+            return True
+        except:
+            try:
+                num_taps = min(num_taps, 50)
+                self.bandpass = signal.firwin(
+                    numtaps=num_taps,
+                    cutoff=(0.8, 1.2),
+                    fs=self.fs,
+                    pass_zero=False
+                )
+                self.transfer_function = np.fft.fft(np.fft.ifftshift(self.bandpass))
+                return True
+            except:
+                return False
+    
+    def process_frame(self, frame):
+        """Process a single frame through EVM pipeline"""
+        # Resize frame
+        if RESIZE_FACTOR < 1.0:
+            h, w = frame.shape[:2]
+            new_w = int(w * RESIZE_FACTOR)
+            new_h = int(h * RESIZE_FACTOR)
+            frame_resized = cv2.resize(frame, (new_w, new_h))
         else:
-            print("⚠️ Could not detect heart rate")
-    else:
-        print("⚠️ Not enough frames for heart rate detection")
-except Exception as e:
-    print(f"⚠️ Heart rate detection failed: {e}")
+            frame_resized = frame.copy()
+        
+        # Store original dimensions
+        if self.rows is None:
+            self.rows, self.cols = frame_resized.shape[:2]
+        
+        # Store original frame
+        self.original_frames.append(frame_resized)
+        
+        # Convert to YIQ
+        yiq_frame = bgr2yiq(np.float32(frame_resized/255))
+        self.yiq_buffer.append(yiq_frame)
+        
+        # Build pyramid
+        pyramid = gaussian_pyramid(yiq_frame, self.level)
+        self.pyramid_buffer.append(pyramid)
+        
+        # Process if buffer is full
+        result_frame = None
+        if len(self.pyramid_buffer) >= self.buffer_size:
+            # Initialize filter if needed
+            if self.bandpass is None:
+                self.create_filter(self.buffer_size)
+            
+            # Apply temporal filtering
+            if self.bandpass is not None:
+                pyramid_stack = np.array(self.pyramid_buffer)
+                
+                # Apply FFT filtering
+                pyr_fft = np.fft.fft(pyramid_stack, axis=0).astype(np.complex64)
+                
+                # Apply filter
+                tf = self.transfer_function[:len(pyramid_stack)]
+                if len(tf) < len(pyramid_stack):
+                    tf_padded = np.zeros(len(pyramid_stack), dtype=tf.dtype)
+                    tf_padded[:len(tf)] = tf
+                else:
+                    tf_padded = tf[:len(pyramid_stack)]
+                
+                filtered = pyr_fft * tf_padded[:, None, None, None].astype(np.complex64)
+                filtered_pyramid = np.fft.ifft(filtered, axis=0).real
+                
+                # Get the most recent filtered pyramid
+                current_filtered = filtered_pyramid[-1]
+                
+                # Extract pyramid channels
+                y_chan = pyramid_stack[-1, 0, :, :]
+                i_chan = pyramid_stack[-1, 1, :, :]
+                q_chan = pyramid_stack[-1, 2, :, :]
+                
+                # Get filtered channels
+                fy_chan = current_filtered[0, :, :] * self.alpha
+                fi_chan = current_filtered[1, :, :] * self.alpha
+                fq_chan = current_filtered[2, :, :] * self.alpha
+                
+                # Upscale filtered channels
+                fy_chan = cv2.resize(fy_chan, (self.cols, self.rows))
+                fi_chan = cv2.resize(fi_chan, (self.cols, self.rows))
+                fq_chan = cv2.resize(fq_chan, (self.cols, self.rows))
+                
+                # Upscale original pyramid channels
+                y_chan_up = cv2.resize(y_chan, (self.cols, self.rows))
+                i_chan_up = cv2.resize(i_chan, (self.cols, self.rows))
+                q_chan_up = cv2.resize(q_chan, (self.cols, self.rows))
+                
+                # Create magnified YIQ
+                yiq_mag = np.zeros((self.rows, self.cols, 3), dtype=np.float32)
+                yiq_mag[:, :, 0] = y_chan_up + fy_chan
+                yiq_mag[:, :, 1] = i_chan_up + fi_chan
+                yiq_mag[:, :, 2] = q_chan_up + fq_chan
+                
+                # Convert to RGB
+                result_frame = inv_colorspace(yiq_mag)
+                
+                # Store filtered buffer for heart rate detection
+                self.filtered_buffer.append(result_frame)
+                
+                # Detect heart rate periodically
+                if len(self.filtered_buffer) % 30 == 0:
+                    self.detect_heart_rate()
+        
+        # Return original frame if buffer not full yet
+        if result_frame is None:
+            result_frame = frame_resized
+        
+        return result_frame
+    
+    def detect_heart_rate(self):
+        """Detect heart rate from filtered frames"""
+        if len(self.filtered_buffer) < 30:
+            return
+        
+        try:
+            red_means = []
+            for frame in self.filtered_buffer:
+                red_means.append(np.mean(frame[:, :, 0]))
+            
+            if len(red_means) > 1:
+                freqs = np.fft.rfftfreq(len(red_means)) * self.fs
+                rates = np.abs(np.fft.rfft(red_means)) / len(red_means)
+                
+                peaks, _ = signal.find_peaks(rates[1:], height=np.max(rates[1:]) * 0.3)
+                
+                if len(peaks) > 0:
+                    peak_idx = peaks[0] + 1
+                    bpm = freqs[peak_idx] * 60
+                    if 40 < bpm < 180:
+                        self.heart_rates.append(bpm)
+                        self.bpm = np.mean(self.heart_rates)
+        except:
+            pass
 
-# ===== Create Output Video =====
-print("\nCreating output video...")
-try:
-    # Get dimensions
-    h, w, _ = magnified[0].shape
+# ===== Main Function (Headless) =====
+def main():
+    print("="*70)
+    print("COLOR MAGNIFICATION - Headless Mode (Codespace Compatible)")
+    print("="*70)
+    print(f"Video path: {VIDEO_PATH}")
+    print(f"Buffer size: {FRAME_BUFFER_SIZE} frames")
+    print(f"Magnification factor: {ALPHA}x")
+    print(f"Processing resolution: {RESIZE_FACTOR*100:.0f}%")
+    print("="*70)
     
-    # Create stacked frames
-    stacked_frames = []
-    for i in range(min(NUM_FRAMES, len(magnified))):
-        # Original frame from pyramid
-        og_frame = np.zeros((rows_proc, cols_proc, 3), dtype=np.float32)
-        og_frame[:, :, 0] = cv2.resize(original_pyramid[i, 0, :, :], (cols_proc, rows_proc))
-        og_frame[:, :, 1] = cv2.resize(original_pyramid[i, 1, :, :], (cols_proc, rows_proc))
-        og_frame[:, :, 2] = cv2.resize(original_pyramid[i, 2, :, :], (cols_proc, rows_proc))
-        
-        og_frame = inv_colorspace(og_frame)
-        
-        # Create side-by-side display
-        middle = np.zeros((h, 5, 3), dtype=np.uint8)
-        
-        left = cv2.cvtColor(og_frame, cv2.COLOR_RGB2BGR)
-        right = cv2.cvtColor(magnified[i], cv2.COLOR_RGB2BGR)
-        
-        # Resize to match if needed
-        if left.shape[0] != right.shape[0] or left.shape[1] != right.shape[1]:
-            right = cv2.resize(right, (left.shape[1], left.shape[0]))
-        
-        combined = np.hstack([left, middle, right])
-        stacked_frames.append(combined)
+    # Check if video exists
+    if not os.path.exists(VIDEO_PATH):
+        print(f"❌ Error: Video file not found: {VIDEO_PATH}")
+        print("Please update VIDEO_PATH to your video file location")
+        return
     
-    if len(stacked_frames) > 0:
-        # Save video
-        output_path = f"stacked_{int(ALPHA)}x.mp4"
-        _h, _w, _ = stacked_frames[-1].shape
-        out = cv2.VideoWriter(
-            output_path,
-            cv2.VideoWriter_fourcc(*'mp4v'), 
-            int(min(fs, 30)), 
-            (_w, _h)
-        )
+    # Open video
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        print(f"❌ Error: Could not open video file: {VIDEO_PATH}")
+        return
+    
+    # Get video properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    print(f"✅ Video loaded: {VIDEO_PATH}")
+    print(f"   Resolution: {width}x{height}")
+    print(f"   FPS: {fps:.1f}")
+    print(f"   Total frames: {total_frames}")
+    
+    # Initialize processor
+    processor = EVMProcessor()
+    processor.fs = fps
+    
+    print("\n🔄 Processing video...")
+    print("This may take a few minutes...")
+    print("-"*70)
+    
+    # Process all frames
+    frame_count = 0
+    processed_frames_original = []
+    processed_frames_magnified = []
+    
+    start_time = time.time()
+    last_progress = 0
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
         
-        for frame in stacked_frames:
-            out.write(frame)
+        frame_count += 1
+        
+        # Process frame
+        processed_frame = processor.process_frame(frame)
+        
+        # Store frames for output
+        processed_frames_original.append(frame)
+        processed_frames_magnified.append(processed_frame)
+        
+        # Show progress
+        progress = int((frame_count / total_frames) * 100)
+        if progress >= last_progress + 10:
+            elapsed = time.time() - start_time
+            estimated_total = (elapsed / frame_count) * total_frames
+            remaining = estimated_total - elapsed
+            
+            print(f"  Progress: {progress}% ({frame_count}/{total_frames}) | "
+                  f"Buffer: {len(processor.pyramid_buffer)}/{processor.buffer_size} | "
+                  f"BPM: {processor.bpm:.1f} | "
+                  f"Remaining: {remaining:.1f}s")
+            last_progress = progress
+    
+    cap.release()
+    print("✅ Processing complete!")
+    
+    # Print summary
+    print("\n" + "="*70)
+    print("PROCESSING SUMMARY")
+    print("="*70)
+    print(f"Frames processed: {frame_count}")
+    if processor.bpm > 0:
+        print(f"✅ Estimated Heart Rate: {processor.bpm:.1f} BPM")
+    else:
+        print("⚠️ Heart rate not detected")
+    print(f"Buffer size: {len(processor.pyramid_buffer)} frames")
+    print("="*70)
+    
+    # Create output video (side-by-side)
+    print("\n📹 Creating output video...")
+    
+    # Resize for output
+    display_width = 640
+    display_height = 480
+    
+    # Determine output dimensions
+    h, w = processed_frames_original[0].shape[:2]
+    aspect_ratio = w / h
+    
+    if h > display_height:
+        h = display_height
+        w = int(h * aspect_ratio)
+    if w > display_width:
+        w = display_width
+        h = int(w / aspect_ratio)
+    
+    # Ensure dimensions are even
+    if h % 2 != 0:
+        h += 1
+    if w % 2 != 0:
+        w += 1
+    
+    # Create video writer
+    try:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(OUTPUT_VIDEO_PATH, fourcc, int(fps), (w*2 + 5, h))
+        
+        for i in range(len(processed_frames_original)):
+            # Resize frames
+            orig = cv2.resize(processed_frames_original[i], (w, h))
+            mag = cv2.resize(processed_frames_magnified[i], (w, h))
+            
+            # Convert to BGR if needed
+            if len(orig.shape) == 3 and orig.shape[2] == 3:
+                orig = cv2.cvtColor(orig, cv2.COLOR_RGB2BGR)
+            if len(mag.shape) == 3 and mag.shape[2] == 3:
+                mag = cv2.cvtColor(mag, cv2.COLOR_RGB2BGR)
+            
+            # Add labels
+            cv2.putText(orig, "ORIGINAL", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(mag, f"MAGNIFIED (BPM: {processor.bpm:.1f})", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+            # Add frame counter
+            cv2.putText(orig, f"Frame: {i+1}/{len(processed_frames_original)}", 
+                       (10, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            
+            # Combine side by side
+            separator = np.ones((h, 5, 3), dtype=np.uint8) * 255
+            combined = np.hstack([orig, separator, mag])
+            
+            out.write(combined)
         
         out.release()
-        print(f"✅ Video saved: {output_path}")
-    else:
-        print("⚠️ No frames to create video")
+        print(f"✅ Output video saved: {OUTPUT_VIDEO_PATH}")
+        print(f"   Resolution: {w*2+5}x{h}")
+        print(f"   Frames: {len(processed_frames_original)}")
+        
+    except Exception as e:
+        print(f"❌ Error creating video: {e}")
     
-except Exception as e:
-    print(f"⚠️ Could not create video: {e}")
+    # Also create a GIF
+    print("\n🎞️ Creating GIF preview...")
+    try:
+        from PIL import Image
+        
+        gif_frames = []
+        step = max(1, len(processed_frames_original) // 30)  # Use ~30 frames for GIF
+        
+        for i in range(0, len(processed_frames_original), step):
+            # Get frame
+            frame = processed_frames_magnified[i]
+            
+            # Convert to RGB
+            if len(frame.shape) == 3 and frame.shape[2] == 3:
+                if frame.dtype != np.uint8:
+                    frame = (frame * 255).astype(np.uint8)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            else:
+                frame_rgb = frame
+            
+            # Resize for GIF
+            gif_h, gif_w = frame_rgb.shape[:2]
+            max_size = 400
+            if gif_w > max_size:
+                scale = max_size / gif_w
+                new_w = int(gif_w * scale)
+                new_h = int(gif_h * scale)
+                frame_rgb = cv2.resize(frame_rgb, (new_w, new_h))
+            
+            gif_frames.append(Image.fromarray(frame_rgb))
+        
+        if gif_frames:
+            gif_path = "evm_output.gif"
+            gif_frames[0].save(
+                gif_path,
+                format="GIF",
+                append_images=gif_frames[1:],
+                save_all=True,
+                duration=100,
+                loop=0
+            )
+            print(f"✅ GIF saved: {gif_path}")
+    
+    except Exception as e:
+        print(f"⚠️ Could not create GIF: {e}")
+    
+    print("\n" + "="*70)
+    print("✅ COMPLETE!")
+    print("="*70)
+    print(f"Output files:")
+    print(f"  - Video: {OUTPUT_VIDEO_PATH}")
+    print(f"  - GIF: evm_output.gif")
+    print("="*70)
 
-# ===== Try to create simple plot =====
-print("\nGenerating visualization...")
-try:
-    # Plot average intensity over time
-    plt.figure(figsize=(10, 4))
-    times = np.arange(0, min(NUM_FRAMES, len(magnified))) / fs
-    
-    # Get average red channel intensity
-    red_means = []
-    for i in range(min(NUM_FRAMES, len(magnified))):
-        if i < len(magnified):
-            red_means.append(np.mean(magnified[i][:, :, 0]))
-    
-    if len(red_means) > 1:
-        plt.plot(times[:len(red_means)], red_means, 'r-', label='Red Channel')
-        plt.xlabel('Time (seconds)')
-        plt.ylabel('Intensity')
-        plt.title(f'Color Magnification Signal (ALPHA={ALPHA}x)')
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.savefig('magnification_signal.png', dpi=150, bbox_inches='tight')
-        print("✅ Plot saved: magnification_signal.png")
-    
-    plt.close()
-    
-except Exception as e:
-    print(f"⚠️ Could not generate plot: {e}")
-
-print("\n" + "="*50)
-print("✅ Processing Complete!")
-print("="*50)
-print(f"Processed {NUM_FRAMES} frames at {fs} FPS")
-print(f"Magnification factor: {ALPHA}x")
-print(f"Gaussian pyramid level: {LEVEL}")
-print(f"Output video: stacked_{int(ALPHA)}x.mp4")
-print("="*50)
-
+# ===== Run =====
+if __name__ == "__main__":
+    main()

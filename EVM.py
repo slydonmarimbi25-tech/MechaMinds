@@ -1,552 +1,377 @@
-"""Converted from color_mag.ipynb"""
+"""Converted from color_mag.ipynb - Optimized for Codespace"""
 
-
-# ===== Markdown Cell 1 =====
-# # **Color Magnification**
-# 
-# In this notebook we will learn how to reveal hidden color vairations in a video! This is called color magnfiication. 
-
-# ===== Code Cell 2 =====
+# ===== Imports =====
 import os
-from glob import glob
 import numpy as np 
 import cv2
-import matplotlib.pyplot as plt 
+import matplotlib
+matplotlib.use('Agg')  # Headless backend for Codespace
+import matplotlib.pyplot as plt
+import scipy.signal as signal
+from PIL import Image
+import warnings
+warnings.filterwarnings('ignore')
 
-# Removed notebook magic: %matplotlib inline
-
-# ===== Markdown Cell 3 =====
-# Get video path
-
-# ===== Markdown Cell 4 =====
-# Add your datapath here
-# You get download videos used for this tutorial [here](http://people.csail.mit.edu/mrub/evm/)
-
-# ===== Code Cell 5 =====
-#DATA_PATH = r"C:\Users\itber\Documents\learning\self_tutorials\phase_based\videos" # add your data path here
+# ===== Configuration - REDUCED FOR CODESPACE =====
 DATA_PATH = "videos"
-
-
-
-
-# ===== Code Cell 6 =====
 VIDEO_NAME = "face.mp4"
-
 VIDEO_PATH = os.path.join(DATA_PATH, VIDEO_NAME)
-print("VIDEO_PATH:", VIDEO_PATH)
-print("Exists:", os.path.exists(VIDEO_PATH))
 
+# Memory-saving settings
+SCALE_FACTOR = 0.3  # Process at 30% resolution
+LEVEL = 3  # Reduced pyramid level (was 4)
+MAX_FRAMES = 150  # Process fewer frames
+ALPHA = 50.0  # Magnification factor
 
+# Temporal filter parameters (for heart rate ~60-100 BPM)
+f_lo = 50/60  # 0.833 Hz
+f_hi = 60/60  # 1.0 Hz
 
+print(f"VIDEO_PATH: {VIDEO_PATH}")
+print(f"Exists: {os.path.exists(VIDEO_PATH)}")
 
-
-
-#os.path.exists(VIDEO_PATH)
-
-#import os
-
-
-
-
-# ===== Markdown Cell 7 =====
-# ## Set Hyperparameters
-
-# ===== Code Cell 8 =====
-# video magnification factor
-ALPHA = 50.0
-
-# Gaussian Pyramid Level of which to apply magnfication
-LEVEL = 4
-
-# Temporal Filter parameters
-f_lo = 50/60
-f_hi = 60/60
-
-# OPTIONAL: override fs
-MANUAL_FS = None
-VIDEO_FS = None
-
-# video frame scale factor
-SCALE_FACTOR = 1.0
-
-# ===== Markdown Cell 9 =====
-# ### Colorspace Functions
-
-# ===== Code Cell 10 =====
-## Color spaces
+# ===== Color Space Functions =====
 def rgb2yiq(rgb):
-    """ Converts an RGB image to YIQ using FCC NTSC format.
-        This is a numpy version of the colorsys implementation
-        https://github.com/python/cpython/blob/main/Lib/colorsys.py
-        Inputs:
-            rgb - (N,M,3) rgb image
-        Outputs
-            yiq - (N,M,3) YIQ image
-        """
-    # compute Luma Channel
+    """Converts RGB to YIQ color space"""
     y = rgb @ np.array([[0.30], [0.59], [0.11]])
-
-    # subtract y channel from red and blue channels
     rby = rgb[:, :, (0,2)] - y
-
     i = np.sum(rby * np.array([[[0.74, -0.27]]]), axis=-1)
     q = np.sum(rby * np.array([[[0.48, 0.41]]]), axis=-1)
-
     yiq = np.dstack((y.squeeze(), i, q))
-    
     return yiq
-
 
 def bgr2yiq(bgr):
-    """ Coverts a BGR image to float32 YIQ """
-    # get normalized YIQ frame
+    """Converts BGR to YIQ"""
     rgb = np.float32(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-    yiq = rgb2yiq(rgb)
-
-    return yiq
-
+    return rgb2yiq(rgb)
 
 def yiq2rgb(yiq):
-    """ Converts a YIQ image to RGB.
-        Inputs:
-            yiq - (N,M,3) YIQ image
-        Outputs:
-            rgb - (N,M,3) rgb image
-        """
+    """Converts YIQ to RGB"""
     r = yiq @ np.array([1.0, 0.9468822170900693, 0.6235565819861433])
     g = yiq @ np.array([1.0, -0.27478764629897834, -0.6356910791873801])
     b = yiq @ np.array([1.0, -1.1085450346420322, 1.7090069284064666])
     rgb = np.clip(np.dstack((r, g, b)), 0, 1)
     return rgb
 
+def inv_colorspace(x):
+    """Convert YIQ back to BGR"""
+    return cv2.normalize(yiq2rgb(x), None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8UC3)
 
-inv_colorspace = lambda x: cv2.normalize(
-    yiq2rgb(x), None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8UC3)
-
-# ===== Markdown Cell 11 =====
-# #### Get Video Frames
-
-# ===== Code Cell 12 =====
-frames = [] # frames for processing
-cap = cv2.VideoCapture(VIDEO_PATH)
-
-# video sampling rate
-fs = cap.get(cv2.CAP_PROP_FPS)
-
-idx = 0
-
-while(cap.isOpened()):
-    ret, frame = cap.read()
-    # if frame is read correctly ret is True
-    if not ret:
-        break
-
-    if idx == 0:
-        og_h, og_w, _ = frame.shape
-        w = int(og_w*SCALE_FACTOR)
-        h = int(og_h*SCALE_FACTOR)
-
-    # convert normalized uint8 BGR to the desired color space
-    # frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    frame = bgr2yiq(np.float32(frame/255))
-
-    # append resized frame
-    frames.append(cv2.resize(frame, (w, h)))
-
-    idx += 1
-    
-    
-cap.release()
-cv2.destroyAllWindows()
-del cap
-
-print("✅ Finished loading frames")
-print("Number of frames:", len(frames))
-
-
-
-
-# ===== Code Cell 13 =====
-NUM_FRAMES = len(frames)
-NUM_FRAMES
-
-# ===== Code Cell 14 =====
-frames[0].min(axis=0).min(axis=0), frames[0].max(axis=0).max(axis=0)
-
-# ===== Markdown Cell 15 =====
-# Override sampling frequency
-
-# ===== Code Cell 16 =====
-print(f"Detected Video Sampling rate: {fs}")
-
-if MANUAL_FS:
-    print(f"Overriding to: {MANUAL_FS}")
-    fs = MANUAL_FS
-    VIDEO_FS = fs
-else:
-    VIDEO_FS = fs
-
-# ===== Markdown Cell 17 =====
-# ## Get Temporal Filter
-
-# ===== Code Cell 18 =====
-import scipy.signal as signal
-
-
-bandpass = signal.firwin(numtaps=NUM_FRAMES,
-                         cutoff=(f_lo, f_hi),
-                         fs=fs,
-                         pass_zero=False)
-
-# ===== Code Cell 19 =====
-transfer_function = np.fft.fft(np.fft.ifftshift(bandpass))
-
-# ===== Code Cell 20 =====
-plt.plot(np.abs(transfer_function))
-plt.title("Transfer Function");
-
-# ===== Code Cell 21 =====
-plt.plot(bandpass)
-plt.title("Impulse Response");
-
-# ===== Code Cell 22 =====
-norm_freqs, response = signal.freqz(bandpass)
-freqs = norm_freqs / np.pi * fs/ 2 
-
-_, ax = plt.subplots(2, 1, figsize=(15, 7))
-ax[0].plot(freqs, 20*np.log10(np.abs(response)));
-ax[0].plot([f_lo, f_lo], [-100, -10], color='m')
-ax[0].plot([f_hi, f_hi], [-100, -10], color='m')
-ax[0].set_title("Frequency Response");
-ax[0].set_ylabel("Amplitude");
-
-ax[1].plot(freqs, np.angle(response));
-ax[1].set_title("Phase Response");
-ax[1].set_xlabel("Freqeuncy (Hz)");
-ax[1].set_ylabel("Angle (radians)");
-
-# ===== Markdown Cell 23 =====
-# ### Gaussian Pyramid
-
-# ===== Code Cell 24 =====
 def gaussian_pyramid(image, level):
-    """ Obtains single band of a Gaussian Pyramid Decomposition
-        Inputs: 
-            image - single channel input image
-            num_levels - number of pyramid levels
-        Outputs:
-            pyramid - Pyramid decomposition tensor
-        """ 
+    """Builds Gaussian pyramid"""
     rows, cols, colors = image.shape
     scale = 2**level
     pyramid = np.zeros((colors, rows//scale, cols//scale))
-
-    for i in range(0, level):
-        # image = cv2.pyrDown(image)
-
-        image = cv2.pyrDown(image, dstsize=(cols//2, rows//2))
-        rows, cols, _ = image.shape
-
+    
+    # Make sure we downsample the correct number of times
+    img = image.copy()
+    for i in range(level):
+        img = cv2.pyrDown(img)
+        rows, cols, _ = img.shape
         if i == (level - 1):
             for c in range(colors):
-                pyramid[c, :, :] = image[:, :, c]
-
+                pyramid[c, :, :] = img[:, :, c]
+    
     return pyramid
 
-# ===== Code Cell 25 =====
+# ===== Load Video Frames =====
+print("\nLoading video frames...")
+frames = []
+cap = cv2.VideoCapture(VIDEO_PATH)
+fs = cap.get(cv2.CAP_PROP_FPS)
+
+if fs <= 0:
+    fs = 30.0  # Default if detection fails
+
+idx = 0
+
+while(cap.isOpened() and idx < MAX_FRAMES):
+    ret, frame = cap.read()
+    if not ret:
+        break
+    
+    if idx == 0:
+        og_h, og_w, _ = frame.shape
+        w = int(og_w * SCALE_FACTOR)
+        h = int(og_h * SCALE_FACTOR)
+        print(f"Original size: {og_w}x{og_h}, Processing at: {w}x{h}")
+    
+    # Convert to YIQ
+    frame = bgr2yiq(np.float32(frame/255))
+    
+    # Resize
+    if SCALE_FACTOR < 1.0:
+        frame = cv2.resize(frame, (w, h))
+    
+    frames.append(frame)
+    idx += 1
+
+cap.release()
+cv2.destroyAllWindows()
+
+NUM_FRAMES = len(frames)
+print(f"✅ Loaded {NUM_FRAMES} frames at {fs} FPS")
+
+if NUM_FRAMES == 0:
+    print("❌ No frames loaded! Check video path.")
+    exit()
+
+# ===== Create Temporal Filter =====
+print("\nCreating temporal filter...")
+# IMPORTANT: Use NUM_FRAMES for filter taps, not a fixed number
+numtaps = NUM_FRAMES  # Use all frames for better filtering
+
+try:
+    bandpass = signal.firwin(
+        numtaps=numtaps,
+        cutoff=(f_lo, f_hi),
+        fs=fs,
+        pass_zero=False
+    )
+    print(f"✅ Filter created with {numtaps} taps")
+except Exception as e:
+    print(f"⚠️ Filter creation failed: {e}")
+    # Fallback to simpler filter with fewer taps
+    numtaps = min(NUM_FRAMES, 50)
+    bandpass = signal.firwin(
+        numtaps=numtaps,
+        cutoff=(0.8, 1.2),
+        fs=fs,
+        pass_zero=False
+    )
+    print(f"✅ Fallback filter created with {numtaps} taps")
+
+transfer_function = np.fft.fft(np.fft.ifftshift(bandpass))
+
+# ===== Build Gaussian Pyramid =====
+print("\nBuilding Gaussian pyramid...")
 rows, cols, colors = frames[0].shape
 scale = 2**LEVEL
-pyramid_stack = np.zeros((NUM_FRAMES, colors, rows//scale, cols//scale))
 
-# ===== Code Cell 26 =====
+# Ensure dimensions are divisible by scale
+rows_proc = (rows // scale) * scale
+cols_proc = (cols // scale) * scale
+
+pyramid_stack = np.zeros((NUM_FRAMES, colors, rows_proc//scale, cols_proc//scale), dtype=np.float32)
+
 for i, frame in enumerate(frames):
+    # Crop to divisible size if needed
+    if frame.shape[0] != rows_proc or frame.shape[1] != cols_proc:
+        frame = frame[:rows_proc, :cols_proc, :]
+    
     pyramid = gaussian_pyramid(frame, LEVEL)
     pyramid_stack[i, :, :, :] = pyramid
 
-# ===== Code Cell 27 =====
-plt.imshow(pyramid_stack[0, :, :, :].transpose(1, 0, 2).reshape((pyramid.shape[1], -1)), cmap='gray');
+print(f"✅ Pyramid built: {pyramid_stack.shape}")
 
-# ===== Markdown Cell 28 =====
-# #### Apply Temporal Filtering
+# Free some memory
+del frames
 
-# ===== Code Cell 29 =====
-pyr_stack_fft = np.fft.fft(pyramid_stack, axis=0).astype(np.complex64)
-_filtered_pyramid = pyr_stack_fft * transfer_function[:, None, None, None].astype(np.complex64)
-filtered_pyramid = np.fft.ifft(_filtered_pyramid, axis=0).real
+# ===== Apply Temporal Filtering =====
+print("\nApplying temporal filtering...")
+try:
+    # FFT along time axis
+    pyr_stack_fft = np.fft.fft(pyramid_stack, axis=0).astype(np.complex64)
+    
+    # IMPORTANT FIX: Ensure transfer_function matches the number of frames
+    # If transfer_function is shorter, pad it; if longer, truncate
+    if len(transfer_function) < NUM_FRAMES:
+        # Pad with zeros
+        tf_padded = np.zeros(NUM_FRAMES, dtype=transfer_function.dtype)
+        tf_padded[:len(transfer_function)] = transfer_function
+    else:
+        # Truncate to NUM_FRAMES
+        tf_padded = transfer_function[:NUM_FRAMES]
+    
+    # Apply filter with correct broadcasting
+    _filtered_pyramid = pyr_stack_fft * tf_padded[:, None, None, None].astype(np.complex64)
+    
+    # Inverse FFT
+    filtered_pyramid = np.fft.ifft(_filtered_pyramid, axis=0).real
+    
+    # Free memory
+    del pyr_stack_fft, _filtered_pyramid, tf_padded
+    
+    print(f"✅ Filtering complete: {filtered_pyramid.shape}")
+    
+except MemoryError as e:
+    print(f"❌ Memory error during filtering: {e}")
+    print("Try reducing SCALE_FACTOR or MAX_FRAMES further")
+    exit()
+except Exception as e:
+    print(f"❌ Error during filtering: {e}")
+    exit()
 
-# ===== Code Cell 30 =====
-pyr_stack_fft.shape
-
-# ===== Code Cell 31 =====
-_, ax = plt.subplots(2, 1, figsize=(10, 5), sharey=True)
-
-ax[0].plot(np.abs(pyr_stack_fft[2:-2, 0, 20, 12]))
-ax[0].set_title("Unfiltered Signal at (20, 12)")
-
-ax[1].plot(np.abs(_filtered_pyramid[2:-2, 0, 20, 12]))
-ax[1].set_title("Filtered Signal at (20, 12)");
-
-plt.tight_layout();
-
-# ===== Code Cell 32 =====
-_, ax = plt.subplots(1, 2)
-ax[0].imshow(pyramid_stack[50, 0, :, :], cmap='gray')
-ax[0].set_title("Unfiltered Luma Channel")
-ax[1].imshow(filtered_pyramid[50, 0, :, :], cmap='gray')
-ax[1].set_title("Filtered Luma Channel");
-
-# ===== Markdown Cell 33 =====
-# Display filtered results at single pixel
-
-# ===== Code Cell 34 =====
-plt.plot(pyramid_stack[:, 0, 12, 20] - pyramid_stack[:, 0, 12, 20].mean())
-plt.plot(filtered_pyramid[:, 0, 12, 20]);
-
-# ===== Markdown Cell 35 =====
-# ## Apply Magnification and Reconstruct Video
-
-# ===== Code Cell 36 =====
-magnified_pyramid = filtered_pyramid * ALPHA
-
-# ===== Code Cell 37 =====
+# ===== Apply Magnification =====
+print("\nApplying magnification...")
 magnified = []
 magnified_only = []
 
+# Store original pyramid for later use (we already have pyramid_stack)
+original_pyramid = pyramid_stack.copy()
+
 for i in range(NUM_FRAMES):
-    y_chan = frames[i][:, :, 0]
-    i_chan = frames[i][:, :, 1] 
-    q_chan = frames[i][:, :, 2] 
+    try:
+        # Get original channels from pyramid
+        y_chan = original_pyramid[i, 0, :, :]
+        i_chan = original_pyramid[i, 1, :, :]
+        q_chan = original_pyramid[i, 2, :, :]
+        
+        # Get filtered channels
+        fy_chan = filtered_pyramid[i, 0, :, :] * ALPHA
+        fi_chan = filtered_pyramid[i, 1, :, :] * ALPHA
+        fq_chan = filtered_pyramid[i, 2, :, :] * ALPHA
+        
+        # Upscale filtered channels back to original size
+        fy_chan = cv2.resize(fy_chan, (cols_proc, rows_proc))
+        fi_chan = cv2.resize(fi_chan, (cols_proc, rows_proc))
+        fq_chan = cv2.resize(fq_chan, (cols_proc, rows_proc))
+        
+        # Upscale original pyramid channels too
+        y_chan_up = cv2.resize(y_chan, (cols_proc, rows_proc))
+        i_chan_up = cv2.resize(i_chan, (cols_proc, rows_proc))
+        q_chan_up = cv2.resize(q_chan, (cols_proc, rows_proc))
+        
+        # Create YIQ image
+        yiq_mag = np.zeros((rows_proc, cols_proc, 3), dtype=np.float32)
+        yiq_mag[:, :, 0] = y_chan_up + fy_chan
+        yiq_mag[:, :, 1] = i_chan_up + fi_chan
+        yiq_mag[:, :, 2] = q_chan_up + fq_chan
+        
+        # Convert to RGB
+        mag = inv_colorspace(yiq_mag)
+        magnified.append(mag)
+        
+        # Store magnified only
+        mag_only = np.dstack((fy_chan, fi_chan, fq_chan))
+        magnified_only.append(mag_only)
+        
+    except Exception as e:
+        print(f"⚠️ Error processing frame {i}: {e}")
+        continue
+
+print(f"✅ Magnification complete: {len(magnified)} frames")
+
+if len(magnified) == 0:
+    print("❌ No frames were magnified successfully!")
+    exit()
+
+# ===== Simple Heart Rate Detection =====
+print("\nDetecting heart rate...")
+try:
+    # Use the magnified video to detect heart rate
+    reds = []
+    for i in range(min(NUM_FRAMES, len(magnified))):
+        if i < len(magnified):
+            reds.append(np.mean(magnified[i][:, :, 0]))
+
+    reds = np.array(reds)
+
+    if len(reds) > 1:
+        freqs = np.fft.rfftfreq(len(reds)) * fs
+        rates = np.abs(np.fft.rfft(reds)) / len(reds)
+        
+        # Find peaks
+        from scipy.signal import find_peaks
+        peaks, _ = find_peaks(rates[1:], height=np.max(rates[1:]) * 0.3)
+        
+        if len(peaks) > 0:
+            peak_idx = peaks[0] + 1
+            bpm = freqs[peak_idx] * 60
+            print(f"✅ Estimated heart rate: {bpm:.1f} BPM")
+        else:
+            print("⚠️ Could not detect heart rate")
+    else:
+        print("⚠️ Not enough frames for heart rate detection")
+except Exception as e:
+    print(f"⚠️ Heart rate detection failed: {e}")
+
+# ===== Create Output Video =====
+print("\nCreating output video...")
+try:
+    # Get dimensions
+    h, w, _ = magnified[0].shape
     
-    fy_chan = cv2.resize(magnified_pyramid[i, 0, :, :], (cols, rows))
-    fi_chan = cv2.resize(magnified_pyramid[i, 1, :, :], (cols, rows))
-    fq_chan = cv2.resize(magnified_pyramid[i, 2, :, :], (cols, rows))
-
-    # apply magnification
-    mag = np.dstack((
-        y_chan + fy_chan,
-        i_chan + fi_chan,
-        q_chan + fq_chan,
-    ))
+    # Create stacked frames
+    stacked_frames = []
+    for i in range(min(NUM_FRAMES, len(magnified))):
+        # Original frame from pyramid
+        og_frame = np.zeros((rows_proc, cols_proc, 3), dtype=np.float32)
+        og_frame[:, :, 0] = cv2.resize(original_pyramid[i, 0, :, :], (cols_proc, rows_proc))
+        og_frame[:, :, 1] = cv2.resize(original_pyramid[i, 1, :, :], (cols_proc, rows_proc))
+        og_frame[:, :, 2] = cv2.resize(original_pyramid[i, 2, :, :], (cols_proc, rows_proc))
+        
+        og_frame = inv_colorspace(og_frame)
+        
+        # Create side-by-side display
+        middle = np.zeros((h, 5, 3), dtype=np.uint8)
+        
+        left = cv2.cvtColor(og_frame, cv2.COLOR_RGB2BGR)
+        right = cv2.cvtColor(magnified[i], cv2.COLOR_RGB2BGR)
+        
+        # Resize to match if needed
+        if left.shape[0] != right.shape[0] or left.shape[1] != right.shape[1]:
+            right = cv2.resize(right, (left.shape[1], left.shape[0]))
+        
+        combined = np.hstack([left, middle, right])
+        stacked_frames.append(combined)
     
-    # normalize and convert to RGB
-    mag = inv_colorspace(mag)
-
-    # store magnified frames
-    magnified.append(mag)
-
-    # store magified only for reference
-    magnified_only.append(np.dstack((fy_chan, fi_chan, fq_chan)))
-
-# ===== Markdown Cell 38 =====
-# Check detected heart rates
-
-# ===== Code Cell 39 =====
-og_reds = []
-og_blues = []
-og_greens = []
-
-reds = []
-blues = []
-greens = []
-for i in range(NUM_FRAMES):
-    # convert YIQ to RGB
-    frame = inv_colorspace(frames[i])
-    og_reds.append(frame[0, :, :].sum())
-    og_blues.append(frame[1, :, :].sum())
-    og_greens.append(frame[2, :, :].sum())
-
-    reds.append(magnified[i][0, :, :].sum())
-    blues.append(magnified[i][1, :, :].sum())
-    greens.append(magnified[i][2, :, :].sum())
-
-# ===== Code Cell 40 =====
-times = np.arange(0, NUM_FRAMES)/fs
-
-# ===== Code Cell 41 =====
-fig, ax = plt.subplots(1, 2, figsize=(15, 5), sharey=True)
-ax[0].plot(times, og_reds, color='red')
-ax[0].plot(times, og_blues, color='blue')
-ax[0].plot(times, og_greens, color='green')
-ax[0].set_title("Original", size=18)
-ax[0].set_xlabel("Time", size=16)
-ax[0].set_ylabel("Intensity", size=16)
-
-ax[1].plot(times, reds, color='red')
-ax[1].plot(times, blues, color='blue')
-ax[1].plot(times, greens, color='green')
-ax[1].set_title("Filtered", size=18)
-ax[1].set_xlabel("Time", size=16);
-
-# ===== Code Cell 42 =====
-freqs = np.fft.rfftfreq(NUM_FRAMES) * fs
-rates = np.abs(np.fft.rfft(reds))/NUM_FRAMES
-
-# ===== Code Cell 43 =====
-plt.plot(freqs[1:], rates[1:]);
-plt.title("DFT of Red channel Intensities")
-plt.xlabel("Freuqency")
-plt.ylabel("Amplitude");
-
-# ===== Markdown Cell 44 =====
-# find peak
-
-# ===== Code Cell 45 =====
-peak_idx, _ = signal.find_peaks(rates, height=1000)
-
-# ===== Code Cell 46 =====
-freqs[peak_idx], rates[peak_idx]
-
-# ===== Code Cell 47 =====
-bpm = freqs[peak_idx].squeeze(0) * 60
-bpm
-
-# ===== Markdown Cell 48 =====
-# ## Make a video
-
-# ===== Code Cell 49 =====
-stacked_frames = []
-middle = np.zeros((rows, 3, 3)).astype(np.uint8)
-
-for vid_idx in range(NUM_FRAMES):
-    og_frame = cv2.normalize(yiq2rgb(frames[vid_idx]), None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8UC3)
-    frame = np.hstack((cv2.cvtColor(og_frame, cv2.COLOR_RGB2BGR), 
-                       middle, 
-                       cv2.cvtColor(magnified[vid_idx], cv2.COLOR_RGB2BGR)))
-    stacked_frames.append(frame)
-
-# ===== Code Cell 50 =====
-plt.imshow(cv2.cvtColor(stacked_frames[10], cv2.COLOR_BGR2RGB));
-
-# ===== Code Cell 51 =====
-# get width and height for video frames
-_h, _w, _ = stacked_frames[-1].shape
-
-# save to mp4
-out = cv2.VideoWriter(f"stacked_{int(ALPHA)}x.mp4",
-                      cv2.VideoWriter_fourcc(*'MP4V'), 
-                      int(fs), 
-                      (_w, _h))
- 
-for frame in stacked_frames:
-    out.write(frame)
-
-out.release()
-del out
-
-# ===== Markdown Cell 52 =====
-# Create a video of the magnified only frames
-
-# ===== Code Cell 53 =====
-# get width and height for video frames
-_h, _w, _ = magnified_only[-1].shape
-
-# save to mp4
-out = cv2.VideoWriter(f"stacked_{int(ALPHA)}x_AMP.mp4",
-                      cv2.VideoWriter_fourcc(*'MP4V'), 
-                      int(fs), 
-                      (_w, _h))
-
-sums = []
-for frame in magnified_only:
-    sums.append(frame.sum(axis=1).sum(axis=0))
+    if len(stacked_frames) > 0:
+        # Save video
+        output_path = f"stacked_{int(ALPHA)}x.mp4"
+        _h, _w, _ = stacked_frames[-1].shape
+        out = cv2.VideoWriter(
+            output_path,
+            cv2.VideoWriter_fourcc(*'mp4v'), 
+            int(min(fs, 30)), 
+            (_w, _h)
+        )
+        
+        for frame in stacked_frames:
+            out.write(frame)
+        
+        out.release()
+        print(f"✅ Video saved: {output_path}")
+    else:
+        print("⚠️ No frames to create video")
     
-    frame = cv2.cvtColor(
-        cv2.normalize(frame*20, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8UC1),
-        cv2.COLOR_RGB2BGR)
-    out.write(frame)
+except Exception as e:
+    print(f"⚠️ Could not create video: {e}")
 
-out.release()
-del out
+# ===== Try to create simple plot =====
+print("\nGenerating visualization...")
+try:
+    # Plot average intensity over time
+    plt.figure(figsize=(10, 4))
+    times = np.arange(0, min(NUM_FRAMES, len(magnified))) / fs
+    
+    # Get average red channel intensity
+    red_means = []
+    for i in range(min(NUM_FRAMES, len(magnified))):
+        if i < len(magnified):
+            red_means.append(np.mean(magnified[i][:, :, 0]))
+    
+    if len(red_means) > 1:
+        plt.plot(times[:len(red_means)], red_means, 'r-', label='Red Channel')
+        plt.xlabel('Time (seconds)')
+        plt.ylabel('Intensity')
+        plt.title(f'Color Magnification Signal (ALPHA={ALPHA}x)')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.savefig('magnification_signal.png', dpi=150, bbox_inches='tight')
+        print("✅ Plot saved: magnification_signal.png")
+    
+    plt.close()
+    
+except Exception as e:
+    print(f"⚠️ Could not generate plot: {e}")
 
-# ===== Markdown Cell 54 =====
-# Create GIF
-
-# ===== Code Cell 55 =====
-h, w, _ = stacked_frames[0].shape
-
-# ===== Code Cell 56 =====
-h2 = np.round(h/2.5).astype(int)
-w2 = np.round(w/2.5).astype(int)
-
-# ===== Code Cell 57 =====
-from PIL import Image 
-
-
-# accumulate PIL image objects
-pil_images = []
-for img in stacked_frames:
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, dsize=(w2, h2))
-    pil_images.append(Image.fromarray(img))
-
-# create GIF
-pil_images[0].save(f"stacked_{int(ALPHA)}x.gif", 
-                    format="GIF", 
-                    append_images=pil_images, 
-                    save_all=True, 
-                    duration=50, # duration that each frame is displayed
-                    loop=0)
-
-# ===== Markdown Cell 58 =====
-# ## Visualize Amplification
-
-# ===== Code Cell 59 =====
-stacked = np.array([cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in stacked_frames])
-
-# ===== Code Cell 60 =====
-frame.shape
-
-# ===== Code Cell 61 =====
-frame = stacked[0, :, :, :].copy()[:, :og_w, :]
-
-forehead_idx = 235
-lcheek_idx = 100
-rcheek_idx = 355
-
-cv2.line(frame, (forehead_idx, 10), (forehead_idx, 200), (0,255,0), 5)
-cv2.line(frame, (lcheek_idx, 285), (lcheek_idx, 425), (0,255,0), 5)
-cv2.line(frame, (rcheek_idx, 285), (rcheek_idx, 425), (0,255,0), 5)
-
-plt.imshow(frame);
-plt.title("Locations");
-
-# ===== Code Cell 62 =====
-idx1 = 220 
-idx2 = idx1 + og_w + 3
-
-# ===== Code Cell 63 =====
-fig, ax = plt.subplots(1, 2, figsize=(7,5))
-fig.suptitle("Middle", size=22)
-ax[0].imshow(stacked[:, :, idx1, :].transpose(1, 0, 2))
-ax[0].set_title("Original Image")
-ax[1].imshow(stacked[:, :, idx2, :].transpose(1, 0, 2))
-ax[1].set_title("Color Magnified");
-
-plt.tight_layout();
-
-# ===== Code Cell 64 =====
-fig, ax = plt.subplots(1, 2, figsize=(7,3))
-fig.suptitle("Forehead", size=22)
-ax[0].imshow(stacked[:, 10:200, forehead_idx, :].transpose(1, 0, 2))
-ax[0].set_title("Original Image")
-ax[1].imshow(stacked[:, 10:200, forehead_idx + og_w + 3, :].transpose(1, 0, 2))
-ax[1].set_title("Color Magnified");
-
-plt.tight_layout();
-
-# ===== Code Cell 65 =====
-fig, ax = plt.subplots(2, 2, figsize=(10, 5))
-fig.suptitle("Cheeks", size=22)
-ax[0, 0].imshow(stacked[:, 285:425, lcheek_idx, :].transpose(1, 0, 2))
-ax[0, 0].set_title("Original Image (Left Cheek)")
-ax[0, 1].imshow(stacked[:, 285:425, lcheek_idx + og_w + 3, :].transpose(1, 0, 2))
-ax[0, 1].set_title("Color Magnified");
-ax[1, 0].imshow(stacked[:, 285:425, rcheek_idx, :].transpose(1, 0, 2))
-ax[1, 0].set_title("Original Image (Right Cheek)")
-ax[1, 1].imshow(stacked[:, 285:425, rcheek_idx + og_w + 3, :].transpose(1, 0, 2))
-ax[1, 1].set_title("Color Magnified");
-
-plt.tight_layout();
-
-# ===== Code Cell 66 =====
+print("\n" + "="*50)
+print("✅ Processing Complete!")
+print("="*50)
+print(f"Processed {NUM_FRAMES} frames at {fs} FPS")
+print(f"Magnification factor: {ALPHA}x")
+print(f"Gaussian pyramid level: {LEVEL}")
+print(f"Output video: stacked_{int(ALPHA)}x.mp4")
+print("="*50)
 

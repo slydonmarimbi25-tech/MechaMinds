@@ -10,6 +10,7 @@ import scipy.signal as signal
 import base64
 import os
 import urllib.request
+from collections import deque
 from flask import Flask, render_template_string, request, jsonify
 
 app = Flask(__name__)
@@ -21,22 +22,37 @@ BUFFER_SIZE = 150       # Number of frames (~5 seconds of data at 30 FPS)
 DEFAULT_FPS = 30        # Target frame rate
 MIN_HR_BPM = 45.0       # Minimum physiological Heart Rate
 MAX_HR_BPM = 210.0      # Maximum physiological Heart Rate
+EVM_BUFFER_SIZE = 12     # Frames used for temporal amplification
+EVM_ALPHA = 5.0          # Magnification strength for subtle color shifts
 
 # Global buffer to keep track of green channel values across incoming browser requests
 green_buffer = []
 current_bpm = 0.0
+evm_history = deque(maxlen=EVM_BUFFER_SIZE)
 
 # ============================================================================
 # FACE DETECTION
 # ============================================================================
 def load_cascade():
-    """Download and load Haar Cascade face detector"""
+    """Download and load Haar Cascade face detector when available."""
     filename = "haarcascade_frontalface_default.xml"
     if not os.path.exists(filename):
-        print("Downloading face detector model...")
-        url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/" + filename
-        urllib.request.urlretrieve(url, filename)
-    return cv2.CascadeClassifier(filename)
+        try:
+            print("Downloading face detector model...")
+            url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/" + filename
+            urllib.request.urlretrieve(url, filename)
+        except Exception as exc:
+            print(f"Face detector download unavailable: {exc}")
+            return None
+
+    try:
+        classifier = cv2.CascadeClassifier(filename)
+        if classifier is None or getattr(classifier, 'empty', lambda: True)():
+            return None
+        return classifier
+    except Exception as exc:
+        print(f"Face detector unavailable in this OpenCV build: {exc}")
+        return None
 
 face_cascade = load_cascade()
 
@@ -85,6 +101,28 @@ def extract_bpm_from_signal(green_signal, fps):
     
     peak_freq = valid_freqs[np.argmax(valid_fft)]
     return peak_freq * 60.0
+
+
+def apply_evm_like_processing(frame, fps=DEFAULT_FPS):
+    """Apply a lightweight EVM-style temporal amplification to a live frame."""
+    if frame is None:
+        return None
+
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_norm = frame_rgb.astype(np.float32) / 255.0
+    evm_history.append(frame_norm)
+
+    if len(evm_history) < 2:
+        return frame
+
+    history_array = np.stack(list(evm_history), axis=0)
+    temporal_mean = np.mean(history_array, axis=0)
+    variation = frame_norm - temporal_mean
+    amplified = frame_norm + (variation * EVM_ALPHA / max(1.0, len(evm_history)))
+    amplified = np.clip(amplified, 0.0, 1.0)
+
+    result = (amplified * 255.0).astype(np.uint8)
+    return cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
 
 # ============================================================================
 # HTML & JAVASCRIPT FRONTEND (RUNS IN YOUR LOCAL BROWSER)
@@ -186,25 +224,31 @@ def process_frame():
     frame = cv2.flip(frame, 1)
     h_img, w_img, _ = frame.shape
 
-    # Detect Face
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(100, 100))
+    # Apply a lightweight EVM-like magnification before display and ROI analysis.
+    processed_frame = apply_evm_like_processing(frame, fps=DEFAULT_FPS)
+    if processed_frame is None:
+        processed_frame = frame
 
+    # Detect Face when the detector is available.
     roi_x, roi_y, roi_w, roi_h = 0, 0, 0, 0
     face_detected = False
 
-    if len(faces) > 0:
-        faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-        (x, y, w, h) = faces[0]
+    if face_cascade is not None:
+        gray = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(100, 100))
 
-        # Forehead ROI calculation
-        roi_x = max(0, x + int(w * 0.25))
-        roi_y = max(0, y + int(h * 0.08))
-        roi_w = min(w_img - roi_x, int(w * 0.50))
-        roi_h = min(h_img - roi_y, int(h * 0.20))
+        if len(faces) > 0:
+            faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+            (x, y, w, h) = faces[0]
 
-        cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 128, 0), 1)
-        face_detected = True
+            # Forehead ROI calculation
+            roi_x = max(0, x + int(w * 0.25))
+            roi_y = max(0, y + int(h * 0.08))
+            roi_w = min(w_img - roi_x, int(w * 0.50))
+            roi_h = min(h_img - roi_y, int(h * 0.20))
+
+            cv2.rectangle(processed_frame, (x, y), (x+w, y+h), (255, 128, 0), 1)
+            face_detected = True
 
     # Center-Crop Fallback if no face detected
     if not face_detected:
@@ -226,19 +270,21 @@ def process_frame():
             current_bpm = extract_bpm_from_signal(np.array(green_buffer), DEFAULT_FPS)
 
         box_color = (0, 255, 0) if face_detected else (0, 255, 255)
-        cv2.rectangle(frame, (roi_x, roi_y), (roi_x+roi_w, roi_y+roi_h), box_color, 2)
+        cv2.rectangle(processed_frame, (roi_x, roi_y), (roi_x+roi_w, roi_y+roi_h), box_color, 2)
 
     # On-Screen HUD Overlay
-    cv2.putText(frame, f"Heart Rate: {current_bpm:.1f} BPM", (20, 40),
+    cv2.putText(processed_frame, f"Heart Rate: {current_bpm:.1f} BPM", (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
     buffer_pct = int((len(green_buffer) / BUFFER_SIZE) * 100)
     status_str = "Status: Locked" if buffer_pct == 100 else f"Status: Buffering ({buffer_pct}%)"
-    cv2.putText(frame, status_str, (20, 70),
+    cv2.putText(processed_frame, status_str, (20, 70),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    cv2.putText(processed_frame, "Live EVM-style Feed", (20, 100),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
     # Encode updated frame back to base64 JPEG
-    _, jpeg = cv2.imencode('.jpg', frame)
+    _, jpeg = cv2.imencode('.jpg', processed_frame)
     b64_output = base64.b64encode(jpeg).decode('utf-8')
 
     return jsonify({'image': f'data:image/jpeg;base64,{b64_output}'})
